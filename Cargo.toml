@@ -1,0 +1,9 @@
+[package]
+name = "cnn"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+ndarray-rand = "0.16.0"
+polars = { version = "0.52.0", default-features = false, features = [ "fmt", "dtype-u8", "lazy" ,"ndarray"] }
+ndarray = { version = "0.17.1" }
