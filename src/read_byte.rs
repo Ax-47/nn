@@ -41,21 +41,23 @@ pub fn load_images(path: &str) -> Result<Vec<Vec<u8>>> {
     Ok(images)
 }
 
-pub fn mnist_to_df(images: Vec<Vec<u8>>, labels: Vec<u8>) -> PolarsResult<DataFrame> {
-    let n = images.len();
-    let pixels = 28 * 28;
+pub fn mnist_to_df(images: Vec<Vec<u8>>, labels: Vec<u8>, limit: usize) -> PolarsResult<DataFrame> {
+    let n = images.len().min(limit);
+    println!("{}", labels.len());
+    assert!(labels.len() >= n);
 
-    assert_eq!(labels.len(), n);
+    let mut chunked_builder =
+        ListPrimitiveChunkedBuilder::<Float64Type>::new("".into(), 1, 784, DataType::Float64);
+    images.into_iter().take(n).for_each(|img| {
+        let im: Vec<f64> = img.into_iter().map(|p| p as f64 / 255.0).collect();
+        chunked_builder.append_slice(&im);
+    });
 
-    // label column
-    let mut columns: Vec<Column> = vec![Column::new("label".into(), labels)];
+    let pixels = chunked_builder.finish().into_series();
+    let labels = labels.into_iter().take(n).collect::<Vec<u8>>();
 
-    // pixel columns
-    for p in 0..pixels {
-        let col: Vec<f32> = images.iter().map(|img| img[p] as f32 / 255.0).collect();
-
-        columns.push(Column::new(format!("pixel_{}", p).into(), col));
-    }
-
-    DataFrame::new(columns)
+    DataFrame::new(vec![
+        Column::new("labels".into(), labels),
+        Column::new("pixels".into(), pixels),
+    ])
 }
