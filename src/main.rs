@@ -7,8 +7,9 @@ fn main() -> PolarsResult<()> {
     let labels = load_labels("train-labels-idx1-ubyte")?;
     let df = mnist_to_df(images, labels, 600)?;
     let n_per_layers: Vec<usize> = vec![784, 16, 16, 10];
-    let nn = neural::NeuralNetwork::new(n_per_layers);
-    nn.train(df)?;
-
+    let mut nn = neural::NeuralNetwork::new(n_per_layers, 0.001);
+    for _ in 0..500 {
+        nn.train(df.clone())?;
+    }
     Ok(())
 }
