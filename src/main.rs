@@ -1,15 +1,24 @@
-use crate::read_byte::{load_images, load_labels, mnist_to_df};
+use crate::read_byte::{load_images, load_labels, mnist_batch_iter, mnist_to_df};
 use polars::prelude::*;
 mod neural;
 mod read_byte;
 fn main() -> PolarsResult<()> {
     let images = load_images("train-images-idx3-ubyte")?;
     let labels = load_labels("train-labels-idx1-ubyte")?;
-    let df = mnist_to_df(images, labels, 600)?;
     let n_per_layers: Vec<usize> = vec![784, 16, 16, 10];
-    let mut nn = neural::NeuralNetwork::new(n_per_layers, 0.001);
-    for _ in 0..500 {
-        nn.train(df.clone())?;
+    // let n_per_layers: Vec<usize> = vec![784, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 10];
+    // let n_per_layers: Vec<usize> = vec![784, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 10];
+    let mut nn = neural::NeuralNetwork::new(n_per_layers, 0.5);
+    for epoch in 0..10 {
+        for batch in mnist_batch_iter(&images, &labels, 64, 60_000) {
+            let df = batch?;
+            nn.train(&df)?;
+        }
+        if epoch == 3 {
+            nn.set_learning_rate(0.005);
+        }
     }
+    let df = mnist_to_df(images, labels, 60)?;
+    nn.test(df.clone())?;
     Ok(())
 }

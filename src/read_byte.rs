@@ -43,7 +43,6 @@ pub fn load_images(path: &str) -> Result<Vec<Vec<u8>>> {
 
 pub fn mnist_to_df(images: Vec<Vec<u8>>, labels: Vec<u8>, limit: usize) -> PolarsResult<DataFrame> {
     let n = images.len().min(limit);
-    println!("{}", labels.len());
     assert!(labels.len() >= n);
 
     let mut chunked_builder =
@@ -60,4 +59,79 @@ pub fn mnist_to_df(images: Vec<Vec<u8>>, labels: Vec<u8>, limit: usize) -> Polar
         Column::new("labels".into(), labels),
         Column::new("pixels".into(), pixels),
     ])
+}
+
+pub fn mnist_to_df_batches(
+    images: Vec<Vec<u8>>,
+    labels: Vec<u8>,
+    batch_size: usize,
+    limit: usize,
+) -> PolarsResult<Vec<DataFrame>> {
+    let n = images.len().min(limit);
+    assert!(labels.len() >= n);
+
+    let mut batches = Vec::new();
+    let mut start = 0;
+
+    while start < n {
+        let end = (start + batch_size).min(n);
+
+        let mut pixel_builder = ListPrimitiveChunkedBuilder::<Float64Type>::new(
+            "pixels".into(),
+            end - start,
+            784,
+            DataType::Float64,
+        );
+
+        for img in &images[start..end] {
+            let im: Vec<f64> = img.iter().map(|p| *p as f64 / 255.0).collect();
+            pixel_builder.append_slice(&im);
+        }
+
+        let pixels = pixel_builder.finish().into_series();
+        let batch_labels = labels[start..end].to_vec();
+
+        let df = DataFrame::new(vec![
+            Column::new("labels".into(), batch_labels),
+            Column::new("pixels".into(), pixels),
+        ])?;
+
+        batches.push(df);
+        start = end;
+    }
+
+    Ok(batches)
+}
+
+pub fn mnist_batch_iter<'a>(
+    images: &'a [Vec<u8>],
+    labels: &'a [u8],
+    batch_size: usize,
+    limit: usize,
+) -> impl Iterator<Item = PolarsResult<DataFrame>> + 'a {
+    let n = images.len().min(limit);
+
+    (0..n).step_by(batch_size).map(move |start| {
+        let end = (start + batch_size).min(n);
+
+        let mut pixel_builder = ListPrimitiveChunkedBuilder::<Float64Type>::new(
+            "pixels".into(),
+            end - start,
+            784,
+            DataType::Float64,
+        );
+
+        for img in &images[start..end] {
+            let im: Vec<f64> = img.iter().map(|p| *p as f64 / 255.0).collect();
+            pixel_builder.append_slice(&im);
+        }
+
+        let pixels = pixel_builder.finish().into_series();
+        let batch_labels = labels[start..end].to_vec();
+
+        DataFrame::new(vec![
+            Column::new("labels".into(), batch_labels),
+            Column::new("pixels".into(), pixels),
+        ])
+    })
 }

@@ -1,9 +1,8 @@
 use std::vec;
 
-use ndarray::{Array, Array1, Array2};
+use ndarray::{Array, Array1, Array2, Axis};
 use ndarray_rand::RandomExt;
 use ndarray_rand::rand_distr::Normal;
-use polars::frame::row::Row;
 use polars::prelude::*;
 #[derive(Debug)]
 pub struct NeuralNetwork {
@@ -11,6 +10,7 @@ pub struct NeuralNetwork {
     weight_matrix: Vec<Array2<f64>>,
     n_layers: usize,
     learning_rate: f64,
+    trained_time: usize,
 }
 impl NeuralNetwork {
     pub fn new(node_per_layer: Vec<usize>, learning_rate: f64) -> Self {
@@ -34,9 +34,49 @@ impl NeuralNetwork {
             weight_matrix,
             n_layers,
             learning_rate,
+            trained_time: 1,
         }
     }
-    pub fn train(&mut self, input: DataFrame) -> PolarsResult<()> {
+
+    pub fn test(&mut self, input: DataFrame) -> PolarsResult<()> {
+        let input_set = input.clone().lazy().select([col("pixels")]).collect()?;
+        let mut chunked_builder =
+            ListPrimitiveChunkedBuilder::<Float64Type>::new("".into(), 1, 10, DataType::Float64);
+        input_set
+            .get_columns()
+            .first()
+            .unwrap()
+            .phys_iter()
+            .for_each(|a0| {
+                let mut a = self.anyvalue_to_array1(&a0);
+                let mut v_z_rn_l: Vec<Array1<f64>> = Vec::new();
+                let mut v_node_rn_l: Vec<Array1<f64>> = Vec::new();
+                for layer in 0..self.n_layers - 1 {
+                    v_node_rn_l.push(a.clone());
+                    a = self.feedforward(a, layer);
+                    v_z_rn_l.push(a.clone());
+                }
+                chunked_builder.append_slice(a.as_slice().unwrap());
+            });
+
+        let series = chunked_builder.finish().into_series();
+        let cols: Vec<Column> = vec![
+            Column::new("results".into(), series),
+            input.column("labels")?.to_owned(),
+        ];
+        let results = DataFrame::new(cols)?;
+        let results = self.diff(results)?;
+        let results = self.create_labels(results)?;
+
+        let results = self.is_collect(results)?;
+        let results = results
+            .lazy()
+            .with_columns([(col("label accuracy").mean() * lit(100.0)).alias("accuracy_percent")])
+            .collect()?;
+        println!("{}", results.head(Some(1)));
+        Ok(())
+    }
+    pub fn train(&mut self, input: &DataFrame) -> PolarsResult<()> {
         let input_set = input.clone().lazy().select([col("pixels")]).collect()?;
         let mut chunked_builder =
             ListPrimitiveChunkedBuilder::<Float64Type>::new("".into(), 1, 10, DataType::Float64);
@@ -99,23 +139,31 @@ impl NeuralNetwork {
         let mut sum_dc_d_bias: Vec<Array1<f64>> = (0..self.n_layers - 1)
             .map(|l| Array1::zeros(self.bias_matrix[l].len()))
             .collect();
-        let mut is_first = true;
         for i in 0..size_of_dataset {
-            let mut cd = v_cd_i[i].clone(); // 2(a^L - y)
-            for layer in (0..self.n_layers - 1).rev() {
-                let z = v_z_any_l[i][layer].clone();
-                let a = v_node_any_l[i][layer].clone();
-                let dc_dw = self.pd_c_by_weight_arr(cd.clone(), z.clone(), a.clone());
-                let dc_db = self.pd_c_by_bais_arr(cd.clone(), z.clone());
-                let dc_da =
-                    self.pd_c_by_ak_arr(cd.clone(), z.clone(), self.weight_matrix[layer].clone());
+            let cd = v_cd_i[i].clone(); // 2(a^L - y)
+            let z = v_z_any_l[i][self.n_layers - 2].clone();
+            let a = v_node_any_l[i][self.n_layers - 2].clone();
+            let mut delta = self.delta(cd.clone(), z.clone());
+            let dc_dw = self.pd_c_by_weight_arr(delta.clone(), a.clone());
+            sum_dc_d_weight[self.n_layers - 2] += &dc_dw;
+            sum_dc_d_bias[self.n_layers - 2] += &delta;
+            for layer in (0..=self.n_layers - 3).rev() {
+                delta = self.delta_w(
+                    self.weight_matrix[layer + 1].clone(),
+                    delta.clone(),
+                    v_z_any_l[i][layer].clone(),
+                );
 
-                sum_dc_d_weight[layer] += &dc_da;
-                sum_dc_d_bias[layer] += &dc_db;
-                cd = 2f64 * (a - dc_dw);
+                let dc_dw = v_node_any_l[i][layer]
+                    .clone()
+                    .view()
+                    .insert_axis(Axis(1))
+                    .dot(&delta.view().insert_axis(Axis(0)));
+                sum_dc_d_weight[layer] += &dc_dw;
+                sum_dc_d_bias[layer] += &delta;
             }
         }
-        // println!("{:#?}", sum_dc_d_weight);
+
         let scale = self.learning_rate / size_of_dataset as f64;
 
         for (w, dw) in self.weight_matrix.iter_mut().zip(sum_dc_d_weight.iter()) {
@@ -129,7 +177,16 @@ impl NeuralNetwork {
             .lazy()
             .select([col("C"), col("C_0").mean().alias("loss")])
             .collect()?;
-        println!("{}", c.head(Some(1)));
+
+        let c = c.get_row(0)?.clone();
+        let c_val = c.0[0].clone();
+        let loss_val = c.0[1].clone();
+
+        println!("C                 = {}", c_val.to_string());
+        println!("loss              = {}", loss_val.to_string());
+        println!("Learning Rate     = {:?}", self.learning_rate);
+        println!("Trainned Times    = {:?}", self.trained_time);
+        self.trained_time += 1;
         Ok(())
     }
     fn cost(&self, results: DataFrame) -> PolarsResult<DataFrame> {
@@ -234,6 +291,89 @@ impl NeuralNetwork {
         Ok(res)
     }
 
+    fn is_collect(&self, results: DataFrame) -> PolarsResult<DataFrame> {
+        let res = results
+            .clone()
+            .lazy()
+            .with_columns([as_struct(vec![col("results"), col("label vec")])
+                .map(
+                    |s| {
+                        let ca = s.struct_()?;
+                        let series_results = ca.field_by_name("results")?;
+                        let series_correctness = ca.field_by_name("label vec")?;
+                        let chunked_results = series_results.list()?;
+                        let chunked_labels = series_correctness.list()?;
+
+                        let gradiat_oprate = |result, label| -> bool { result == label };
+                        let out: BooleanChunked = chunked_results
+                            .into_iter()
+                            .zip(chunked_labels)
+                            .map(|(result, label)| match (result, label) {
+                                (Some(a), Some(b)) => {
+                                    let v = gradiat_oprate(a, b);
+                                    Some(v)
+                                }
+                                _ => None,
+                            })
+                            .collect();
+
+                        Ok(out.into_column())
+                    },
+                    |_, f| Ok(Field::new(f.name().clone(), DataType::Boolean)),
+                )
+                .alias("label accuracy")])
+            .collect()?;
+        Ok(res)
+    }
+    fn diff(&self, results: DataFrame) -> PolarsResult<DataFrame> {
+        let res = results
+            .clone()
+            .lazy()
+            .with_columns([as_struct(vec![col("results"), col("labels")])
+                .map(
+                    |s| {
+                        let ca = s.struct_()?;
+                        let series_results = ca.field_by_name("results")?;
+                        let series_correctness = ca.field_by_name("labels")?;
+                        let chunked_results = series_results.list()?;
+                        let chunked_labels = series_correctness.u8()?;
+
+                        let create_expect_vec = |n: usize| {
+                            let mut arr = vec![0.; 10];
+                            arr[n] = 1.;
+                            Series::new("".into(), arr)
+                        };
+                        let gradiat_oprate = |result, label| -> PolarsResult<Series> {
+                            let diff: Series = (result - create_expect_vec(label))?;
+                            Ok(diff)
+                        };
+                        let out: ListChunked = chunked_results
+                            .into_iter()
+                            .zip(chunked_labels)
+                            .map(|(result, label)| match (result, label) {
+                                (Some(a), Some(b)) => {
+                                    let v = gradiat_oprate(a, b as usize).ok()?;
+                                    Some(v)
+                                }
+                                _ => None,
+                            })
+                            .collect();
+
+                        Ok(out.into_column())
+                    },
+                    |_, f| {
+                        Ok(Field::new(
+                            f.name().clone(),
+                            DataType::List(Box::new(
+                                Field::new("".into(), DataType::Float64).dtype,
+                            )),
+                        ))
+                    },
+                )
+                .alias("diff")])
+            .collect()?;
+        Ok(res)
+    }
     fn c_0(&self, results: DataFrame) -> PolarsResult<DataFrame> {
         let res = results
             .clone()
@@ -277,25 +417,29 @@ impl NeuralNetwork {
             .collect()?;
         Ok(res)
     }
-    fn agg_cost_per_instance(&self, results: DataFrame) -> PolarsResult<Array1<f64>> {
+
+    fn create_labels(&self, results: DataFrame) -> PolarsResult<DataFrame> {
         let res = results
             .clone()
             .lazy()
-            .with_columns([as_struct(vec![col("sigma_i")])
+            .with_columns([as_struct(vec![col("labels")])
                 .map(
                     |s| {
                         let ca = s.struct_()?;
-                        let series_correctness = ca.field_by_name("sigma_i")?;
-                        let chunked_correctness = series_correctness.list()?;
+                        let series_correctness = ca.field_by_name("labels")?;
+                        let chunked_labels = series_correctness.u8()?;
 
-                        let arr = vec![0f64; 10];
-                        let mut sum_c = Series::new("".into(), arr);
-                        let out: ListChunked = chunked_correctness
+                        let create_expect_vec = |n: usize| {
+                            let mut arr = vec![0.; 10];
+                            arr[n] = 1.;
+                            Series::new("".into(), arr)
+                        };
+                        let out: ListChunked = chunked_labels
                             .into_iter()
-                            .map(|correctness| match correctness {
+                            .map(|label| match label {
                                 Some(a) => {
-                                    sum_c = (sum_c.clone() + a).ok()?;
-                                    Some(sum_c.clone())
+                                    let v = create_expect_vec(a as usize);
+                                    Some(v)
                                 }
                                 _ => None,
                             })
@@ -312,43 +456,20 @@ impl NeuralNetwork {
                         ))
                     },
                 )
-                .alias("sum C_0")])
+                .alias("label vec")])
             .collect()?;
-        let agg = res
-            .clone()
-            .lazy()
-            .select([(col("sum C_0") / col("sigma_i").count()).alias("avg C_0")])
-            .last()
-            .collect()?;
-        let row = agg.get_row(0)?;
-        let arr: Array1<f64> = match &row.0[0] {
-            AnyValue::List(series) => Array1::from_iter(series.f64()?.into_no_null_iter()),
-            _ => unreachable!(),
-        };
-
-        Ok(arr)
+        Ok(res)
     }
-
-    fn pd_c_by_weight_arr(&self, c: Array1<f64>, z: Array1<f64>, ak: Array1<f64>) -> Array1<f64> {
-        c.dot(&z.mapv(Self::relu_prime)) * (ak)
+    fn delta_w(&self, w: Array2<f64>, delta: Array1<f64>, z: Array1<f64>) -> Array1<f64> {
+        w.dot(&delta) * z
     }
-
-    fn pd_c_by_ak_arr(&self, c: Array1<f64>, z: Array1<f64>, w: Array2<f64>) -> Array2<f64> {
-        c * z.mapv(Self::relu_prime) * w
+    fn delta(&self, c: Array1<f64>, z: Array1<f64>) -> Array1<f64> {
+        c * z.mapv(Self::relu_prime)
     }
-
-    fn pd_c_by_bais_arr(&self, c: Array1<f64>, z: Array1<f64>) -> Array1<f64> {
-        c * (z.mapv(Self::relu_prime))
-    }
-    fn pd_c_by_bais(&self, c: f64, z: f64) -> f64 {
-        c * Self::relu_prime(z)
-    }
-
-    fn pd_c_by_ak(&self, c: f64, z: f64, w: f64) -> f64 {
-        c * Self::relu_prime(z) * w
-    }
-    fn pd_c_by_weight(&self, c: f64, z: f64, ak: f64) -> f64 {
-        c * Self::relu_prime(z) * ak
+    fn pd_c_by_weight_arr(&self, delta: Array1<f64>, ak: Array1<f64>) -> Array2<f64> {
+        ak.view()
+            .insert_axis(Axis(1))
+            .dot(&delta.view().insert_axis(Axis(0)))
     }
 
     fn feedforward(&self, a: Array1<f64>, layer: usize) -> Array1<f64> {
@@ -369,39 +490,39 @@ impl NeuralNetwork {
         1f64
     }
 
+    pub fn set_learning_rate(&mut self, rl: f64) {
+        self.learning_rate = rl;
+    }
+    pub fn decesses(&mut self, rl: f64) {
+        self.learning_rate -= rl;
+    }
     fn anyvalue_to_array1(&self, s: &AnyValue<'_>) -> Array1<f64> {
         match s {
             AnyValue::List(s) => {
                 let v: Vec<f64> = s.f64().unwrap().into_no_null_iter().collect();
-                return Array1::from(v);
+                Array1::from(v)
             }
             _ => panic!("expected List[f64]"),
         }
     }
-
-    fn anyvalue_to_f64(&self, s: &AnyValue<'_>) -> f64 {
-        match s {
-            AnyValue::Float64(s) => *s,
-            _ => panic!("expected List[f64]"),
+    fn detect_grad_norm(norm: f64, layer: usize, name: &str) {
+        if norm < 1e-8 {
+            println!(
+                "☠️  DEAD GRADIENT | layer {} {} | norm = {:.3e}",
+                layer, name, norm
+            );
+        } else if norm > 1e3 {
+            println!(
+                "🔥 EXPLODING GRADIENT | layer {} {} | norm = {:.3e}",
+                layer, name, norm
+            );
         }
-    }
-    fn row_to_array1(&self, s: &Row<'_>) -> Array1<f64> {
-        match s {
-            Row(s) => {
-                let v: Vec<f64> = s.iter().map(|x| self.anyvalue_to_f64(x)).collect();
-                return Array1::from(v);
-            }
-            _ => panic!("expected List[f64]"),
-        }
-    }
-    pub fn print(&self) {
-        println!("bais :{:#?}", self.bias_matrix[0]);
-        println!("weight :{:#?}", self.weight_matrix[0]);
     }
 
-    pub fn print_shape(&self) {
-        for i in self.weight_matrix.clone() {
-            println!("weight :{:#?}", i.shape());
-        }
+    fn grad_norm_1d(g: &Array1<f64>) -> f64 {
+        g.iter().map(|x| x * x).sum::<f64>().sqrt()
+    }
+    fn grad_norm_2d(g: &Array2<f64>) -> f64 {
+        g.iter().map(|x| x * x).sum::<f64>().sqrt()
     }
 }
