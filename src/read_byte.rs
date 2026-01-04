@@ -1,137 +1,98 @@
-use polars::prelude::*;
+use ndarray::s;
+use ndarray::{Array1, Array2, ArrayView1, ArrayView2};
 use std::fs::File;
 use std::io::{Read, Result};
-
-pub fn read_u32_be(buf: &[u8]) -> u32 {
-    u32::from_be_bytes(buf.try_into().unwrap())
+pub struct DataSet {
+    pub labels: Array1<u8>,
+    pub images: Array2<u8>,
 }
 
-pub fn load_labels(path: &str) -> Result<Vec<u8>> {
-    let mut file = File::open(path)?;
-    let mut buf = Vec::new();
-    file.read_to_end(&mut buf)?;
-
-    let magic = read_u32_be(&buf[0..4]);
-    assert_eq!(magic, 2049);
-
-    let num = read_u32_be(&buf[4..8]) as usize;
-    Ok(buf[8..8 + num].to_vec())
+pub struct BatchView<'a> {
+    pub images: ArrayView2<'a, u8>, // (batch, 784)
+    pub labels: ArrayView1<'a, u8>, // (batch)
 }
-pub fn load_images(path: &str) -> Result<Vec<Vec<u8>>> {
-    let mut file = File::open(path)?;
-    let mut buf = Vec::new();
-    file.read_to_end(&mut buf)?;
+impl<'a> BatchView<'a> {
+    pub fn images_vecf64(&self) -> Array2<f64> {
+        let (batch, dim) = self.images.dim();
+        let mut buf = Vec::with_capacity(batch * dim);
 
-    let magic = read_u32_be(&buf[0..4]);
-    assert_eq!(magic, 2051);
-
-    let num = read_u32_be(&buf[4..8]) as usize;
-    let rows = read_u32_be(&buf[8..12]) as usize;
-    let cols = read_u32_be(&buf[12..16]) as usize;
-
-    let image_size = rows * cols;
-    let mut images = Vec::with_capacity(num);
-
-    let mut offset = 16;
-    for _ in 0..num {
-        images.push(buf[offset..offset + image_size].to_vec());
-        offset += image_size;
-    }
-
-    Ok(images)
-}
-
-pub fn mnist_to_df(images: Vec<Vec<u8>>, labels: Vec<u8>, limit: usize) -> PolarsResult<DataFrame> {
-    let n = images.len().min(limit);
-    assert!(labels.len() >= n);
-
-    let mut chunked_builder =
-        ListPrimitiveChunkedBuilder::<Float64Type>::new("".into(), 1, 784, DataType::Float64);
-    images.into_iter().take(n).for_each(|img| {
-        let im: Vec<f64> = img.into_iter().map(|p| p as f64 / 255.0).collect();
-        chunked_builder.append_slice(&im);
-    });
-
-    let pixels = chunked_builder.finish().into_series();
-    let labels = labels.into_iter().take(n).collect::<Vec<u8>>();
-
-    DataFrame::new(vec![
-        Column::new("labels".into(), labels),
-        Column::new("pixels".into(), pixels),
-    ])
-}
-
-pub fn mnist_to_df_batches(
-    images: Vec<Vec<u8>>,
-    labels: Vec<u8>,
-    batch_size: usize,
-    limit: usize,
-) -> PolarsResult<Vec<DataFrame>> {
-    let n = images.len().min(limit);
-    assert!(labels.len() >= n);
-
-    let mut batches = Vec::new();
-    let mut start = 0;
-
-    while start < n {
-        let end = (start + batch_size).min(n);
-
-        let mut pixel_builder = ListPrimitiveChunkedBuilder::<Float64Type>::new(
-            "pixels".into(),
-            end - start,
-            784,
-            DataType::Float64,
-        );
-
-        for img in &images[start..end] {
-            let im: Vec<f64> = img.iter().map(|p| *p as f64 / 255.0).collect();
-            pixel_builder.append_slice(&im);
+        for row in self.images.rows() {
+            buf.extend(row.iter().map(|p| *p as f64 / 255.0));
         }
 
-        let pixels = pixel_builder.finish().into_series();
-        let batch_labels = labels[start..end].to_vec();
-
-        let df = DataFrame::new(vec![
-            Column::new("labels".into(), batch_labels),
-            Column::new("pixels".into(), pixels),
-        ])?;
-
-        batches.push(df);
-        start = end;
+        Array2::from_shape_vec((batch, dim), buf).unwrap()
     }
+    pub fn label_one_hot(&self) -> Array2<f64> {
+        let batch = self.labels.len();
+        let mut buf = Vec::with_capacity(batch * 10);
 
-    Ok(batches)
-}
-
-pub fn mnist_batch_iter<'a>(
-    images: &'a [Vec<u8>],
-    labels: &'a [u8],
-    batch_size: usize,
-    limit: usize,
-) -> impl Iterator<Item = PolarsResult<DataFrame>> + 'a {
-    let n = images.len().min(limit);
-
-    (0..n).step_by(batch_size).map(move |start| {
-        let end = (start + batch_size).min(n);
-
-        let mut pixel_builder = ListPrimitiveChunkedBuilder::<Float64Type>::new(
-            "pixels".into(),
-            end - start,
-            784,
-            DataType::Float64,
-        );
-
-        for img in &images[start..end] {
-            let im: Vec<f64> = img.iter().map(|p| *p as f64 / 255.0).collect();
-            pixel_builder.append_slice(&im);
+        for &label in self.labels.iter() {
+            let mut v = vec![0.0; 10];
+            v[label as usize] = 1.0;
+            buf.extend(v);
         }
 
-        let pixels = pixel_builder.finish().into_series();
-        let batch_labels = labels[start..end].to_vec();
+        Array2::from_shape_vec((batch, 10), buf).unwrap()
+    }
+}
+impl DataSet {
+    pub fn new(image_path: &str, label_path: &str) -> Result<Self> {
+        let images = Self::load_images_ndarray(image_path)?;
+        let labels = Self::load_labels(label_path)?;
 
-        DataFrame::new(vec![
-            Column::new("labels".into(), batch_labels),
-            Column::new("pixels".into(), pixels),
-        ])
-    })
+        assert_eq!(images.nrows(), labels.len());
+
+        Ok(Self { images, labels })
+    }
+    fn read_u32_be(buf: &[u8]) -> u32 {
+        u32::from_be_bytes(buf.try_into().unwrap())
+    }
+
+    fn load_labels(path: &str) -> Result<Array1<u8>> {
+        let mut file = File::open(path)?;
+        let mut buf = Vec::new();
+        file.read_to_end(&mut buf)?;
+
+        let magic = Self::read_u32_be(&buf[0..4]);
+        assert_eq!(magic, 2049);
+
+        let num = Self::read_u32_be(&buf[4..8]) as usize;
+        let arr = Array1::from_vec(buf[8..8 + num].to_vec());
+        Ok(arr)
+    }
+    fn load_images_ndarray(path: &str) -> Result<Array2<u8>> {
+        let mut file = File::open(path)?;
+        let mut buf = Vec::new();
+        file.read_to_end(&mut buf)?;
+
+        let magic = Self::read_u32_be(&buf[0..4]);
+        assert_eq!(magic, 2051);
+
+        let num = Self::read_u32_be(&buf[4..8]) as usize;
+        let rows = Self::read_u32_be(&buf[8..12]) as usize;
+        let cols = Self::read_u32_be(&buf[12..16]) as usize;
+
+        let image_size = rows * cols;
+        let offset = 16;
+
+        let data = &buf[offset..offset + num * image_size];
+
+        Ok(Array2::from_shape_vec((num, image_size), data.to_vec()).unwrap())
+    }
+    pub fn batch_view_iter(
+        &self,
+        batch_size: usize,
+        limit: usize,
+    ) -> impl Iterator<Item = BatchView<'_>> {
+        let n = self.labels.len().min(limit);
+
+        (0..n).step_by(batch_size).map(move |start| {
+            let end = (start + batch_size).min(n);
+
+            BatchView {
+                labels: self.labels.slice(s![start..end]),
+                images: self.images.slice(s![start..end, ..]),
+            }
+        })
+    }
 }
